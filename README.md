@@ -99,6 +99,32 @@ Estas variables se aplican al **servidor MCP**, que es donde vive la lógica.
 Para mostrar una reserva aceptada en temporada de lluvia, reiniciar el MCP con
 `PARACHUTE_WEATHER_FIXTURE=fixtures/favorable.json` (o `marginal.json`).
 
+## Video de demostración
+
+`docs/demo.mp4` (≈75 s, sin audio) muestra en una sola pantalla dividida con `tmux`:
+
+1. **Servidor MCP** arrancando y emitiendo `tool #N → … ✓ … (ms)` por cada herramienta ejecutada.
+2. **Servidor A2A** arrancando con el MAS (`openai-agents (groq: openai/gpt-oss-20b)`), sirviendo
+   la Agent Card y registrando `tarea … → ruta=coordinador → agente_…`.
+3. **Terminal cliente A2A**: lee la Agent Card (3 skills) y conversa: FAQ, clima de mañana,
+   fecha fuera de rango, intento de reserva en dos turnos (el agente revisa el clima y no agenda
+   porque el pronóstico real trae lluvia) y listado de citas.
+
+Usa Open-Meteo real (sin fixtures); en la fecha de grabación (2026-10-17) ningún día del
+pronóstico era apto, por eso la reserva se rechaza. Para mostrar una reserva aceptada, arrancar
+el MCP con `PARACHUTE_WEATHER_FIXTURE=fixtures/favorable.json`. Las esperas de Groq se recortan
+a 2.5 s al renderizar. Se grabó con `MODEL=openai/gpt-oss-20b` porque la cuota diaria gratuita
+de Groq para `gpt-oss-120b` (200 000 tokens/día) se agotó durante las pruebas; ambos modelos funcionan.
+
+Regenerarlo (requiere `tmux`, `asciinema`, `ffmpeg` y [`agg`](https://github.com/asciinema/agg)):
+
+```bash
+PAUSE=15 scripts/record_demo.sh docs/demo.cast   # PAUSE: segundos entre preguntas (límite de Groq)
+agg --idle-time-limit 2.5 --font-size 14 --fps-cap 15 docs/demo.cast docs/demo.gif
+ffmpeg -i docs/demo.gif -movflags faststart -pix_fmt yuv420p \
+       -vf "scale=trunc(iw/2)*2:trunc(ih/2)*2" docs/demo.mp4
+```
+
 ## Cambios respecto a HDT-5
 
 - Clima con la opción **`daily`** de Open-Meteo en `America/Guatemala`
@@ -106,3 +132,6 @@ Para mostrar una reserva aceptada en temporada de lluvia, reiniciar el MCP con
   `precipitation_sum`, `cloud_cover_mean`) en lugar de la primera hora UTC.
 - FAQ con el corpus real de Parachute S.A. (120 fichas de HDT-4) y normalización de acentos.
 - Nueva herramienta de agenda que **revisa el clima antes de reservar** y persiste en `data/appointments.json`.
+- Rango de pronóstico: 16 días **contando hoy** (último día consultable = hoy + 15). Si Open-Meteo
+  devuelve `null` en alguna variable, el estado es `unavailable` y no se agenda (antes un `null`
+  se leía como 0 y el día parecía favorable).

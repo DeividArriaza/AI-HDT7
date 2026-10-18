@@ -57,6 +57,9 @@ class AppointmentBook:
         if report.status == "rejected":
             return BookingResult(False, f"No se agendó: el {report.date} no es seguro para saltar ("
                                  + "; ".join(report.reasons) + ").", report.to_dict())
+        if report.status == "unavailable":
+            return BookingResult(False, f"No se agendó: no hay pronóstico completo para el {report.date} ("
+                                 + "; ".join(report.reasons) + ").", report.to_dict())
         appointment = Appointment(
             appointment_id=f"CITA-{uuid.uuid4().hex[:8].upper()}",
             name=name.strip(),

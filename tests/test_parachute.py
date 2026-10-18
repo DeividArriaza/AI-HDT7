@@ -45,9 +45,18 @@ def test_safety_rules(kwargs, status):
 
 
 def test_weather_rejects_dates_beyond_16_days():
-    with pytest.raises(DateOutOfRange):
-        weather("favorable").assess(date(2026, 11, 3))
-    assert weather("favorable").assess(date(2026, 11, 2)).status == "favorable"
+    with pytest.raises(DateOutOfRange):  # 16 días contando hoy: el último es hoy + 15
+        weather("favorable").assess(date(2026, 11, 2))
+    assert weather("favorable").assess(date(2026, 11, 1)).status == "favorable"
+
+
+def test_missing_forecast_values_are_never_favorable(tmp_path: Path):
+    nulls = tmp_path / "nulls.json"
+    nulls.write_text(json.dumps({"daily": {k: [None] for k in (
+        "wind_speed_10m_max", "wind_gusts_10m_max", "temperature_2m_max", "precipitation_sum", "cloud_cover_mean")}}))
+    service = WeatherService(FixtureHttp(nulls), today=TODAY)
+    assert service.assess(date(2026, 10, 20)).status == "unavailable"
+    assert not AppointmentBook(service).book("Ana", date(2026, 10, 20)).booked
 
 
 def test_booking_checks_weather_first(tmp_path: Path):

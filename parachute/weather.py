@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlencode
@@ -19,7 +19,8 @@ LATITUDE = 14.013722
 LONGITUDE = -90.771611
 API_URL = "https://api.open-meteo.com/v1/forecast"
 TIMEZONE = "America/Guatemala"
-MAX_FORECAST_DAYS = 16
+FORECAST_DAYS = 16  # Open-Meteo: 16 días contando hoy
+MAX_FORECAST_DAYS = FORECAST_DAYS - 1  # último día consultable = hoy + 15
 # Variable lógica del enunciado -> variable `daily` de Open-Meteo.
 DAILY = {
     "wind_speed_10m": "wind_speed_10m_max",
@@ -73,7 +74,7 @@ def forecast_params(requested_date: date) -> dict[str, str]:
 @dataclass(frozen=True)
 class WeatherResult:
     date: str
-    status: str  # favorable | marginal | rejected
+    status: str  # favorable | marginal | rejected | unavailable
     reasons: list[str]
     values: dict[str, float]
     citation: str
@@ -114,21 +115,31 @@ class WeatherService:
     def today(self) -> date:
         return self._today or date.today()
 
+    @property
+    def last_forecast_day(self) -> date:
+        return self.today + timedelta(days=MAX_FORECAST_DAYS)
+
     def validate_date(self, requested_date: date) -> None:
         days = (requested_date - self.today).days
         if days < 0:
             raise DateOutOfRange(f"La fecha {requested_date} ya pasó; hoy es {self.today}.")
         if days > MAX_FORECAST_DAYS:
             raise DateOutOfRange(
-                f"Open-Meteo solo pronostica {MAX_FORECAST_DAYS} días; {requested_date} está a {days} días "
-                f"de hoy ({self.today}). Elija una fecha hasta {date.fromordinal(self.today.toordinal() + MAX_FORECAST_DAYS)}."
+                f"Open-Meteo solo pronostica {FORECAST_DAYS} días (hoy incluido); {requested_date} está a {days} días "
+                f"de hoy ({self.today}). Elija una fecha hasta {self.last_forecast_day}."
             )
 
     def assess(self, requested_date: date) -> WeatherResult:
         self.validate_date(requested_date)
         params = forecast_params(requested_date)
         daily = self.http.get_json(API_URL, params)["daily"]
-        values = {name: float(daily[api_name][0] or 0.0) for name, api_name in DAILY.items()}
+        raw = {name: daily[api_name][0] for name, api_name in DAILY.items()}
+        missing = [name for name, value in raw.items() if value is None]
+        if missing:  # un valor ausente nunca debe leerse como 0 (= "favorable")
+            return WeatherResult(requested_date.isoformat(), "unavailable",
+                                 [f"Open-Meteo no tiene datos de {', '.join(missing)} para esa fecha"],
+                                 {}, f"{API_URL}?{urlencode(params)}")
+        values = {name: float(value) for name, value in raw.items()}
         status, rejected, marginal = classify(values)
         return WeatherResult(
             date=requested_date.isoformat(),

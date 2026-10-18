@@ -59,22 +59,32 @@ class MultiAgentSystem(Protocol):
 # --------------------------------------------------------------------------- OpenAI Agents SDK
 
 COORDINATOR_PROMPT = """Eres el coordinador de atención de Parachute S.A. (paracaidismo tándem, Guatemala).
-Responde en español, breve y claro. No inventes datos: delega siempre.
+Responde en español, breve y claro. No inventes datos: delega SIEMPRE en un especialista,
+incluso si crees saber la respuesta por la conversación (por ejemplo, para listar citas o
+verificar fechas): la información vigente solo la tienen las herramientas.
 - Preguntas sobre el evento, precios, requisitos, logística o políticas → `agente_faq`.
 - Clima de una fecha, agendar citas o consultar citas → `agente_clima_citas`.
-Pasa al especialista toda la información relevante del usuario (nombre, fecha, personas).
-Conserva las citas (faq_id o URL de Open-Meteo) que devuelvan los especialistas."""
+Pasa al especialista toda la información relevante acumulada en la conversación (nombre, fecha,
+personas) y pídele explícitamente la acción: "agendar", "consultar clima" o "listar citas".
+Solo confirma una cita si el especialista devuelve un identificador CITA-….
+Conserva las citas (faq_id o URL de Open-Meteo) y los valores exactos que devuelvan los especialistas."""
 
 FAQ_PROMPT = """Eres el especialista del FAQ de Parachute S.A. Usa SIEMPRE `buscar_faq`.
 Responde solo con lo que diga el FAQ y cita el `faq_id` como [FAQ-xxx].
 Si `found` es false, di que no hay respuesta sustentada en el FAQ."""
 
 SCHEDULER_PROMPT = """Eres el especialista de clima y citas de Parachute S.A.
-- Si el usuario usa fechas relativas (hoy, mañana, el sábado), llama primero `fecha_actual`.
-- Para clima usa `consultar_clima_salto`; para reservar usa `agendar_cita` (ya revisa el clima).
+- Resuelve fechas relativas (hoy, mañana, el sábado) con la fecha de hoy indicada abajo.
+- Cualquier fecha entre hoy y el último día con pronóstico es válida: consúltala, no la rechaces.
+- Para clima usa `consultar_clima_salto` SOLO con la fecha que pidió el usuario; no explores otras
+  fechas por tu cuenta (sugiere que el usuario indique otra).
+- Para reservar DEBES llamar `agendar_cita` (ya revisa el clima). Nunca digas que una cita quedó
+  agendada si `agendar_cita` no devolvió `booked: true`; incluye el `appointment_id` (CITA-…).
+- Para mostrar citas DEBES llamar `listar_citas`.
 - Para reservar necesitas nombre y fecha; si falta algo, pídelo.
 - Si la fecha supera los 16 días de pronóstico, explica que no se puede y sugiere una fecha válida.
-- Estados: favorable = ideal; marginal = solo tándem experimentado; rejected = NO SEGURO.
+- Estados: favorable = ideal; marginal = solo tándem experimentado; rejected = NO SEGURO;
+  unavailable = Open-Meteo no tiene datos (no se puede evaluar ni agendar).
 Incluye los valores con las unidades de `units` (viento en km/h), la ubicación de `location`
 (no inventes otra) y cita la URL de Open-Meteo."""
 
@@ -98,7 +108,8 @@ class OpenAIAgentsMAS:
         set_tracing_disabled(True)  # el tracing sube trazas a OpenAI; no aplica con Groq
         model = os.environ.get("MODEL", "openai/gpt-oss-120b")
         self.name = f"openai-agents (groq: {model})"
-        client = AsyncOpenAI(base_url=os.environ.get("BASE_URL", "https://api.groq.com/openai/v1"), api_key=groq_key)
+        client = AsyncOpenAI(base_url=os.environ.get("BASE_URL", "https://api.groq.com/openai/v1"), api_key=groq_key,
+                             max_retries=6)  # el plan gratuito de Groq limita tokens por minuto (429)
         return OpenAIChatCompletionsModel(model=model, openai_client=client)
 
     def _mcp(self, name: str, tools: list[str]):
@@ -113,33 +124,47 @@ class OpenAIAgentsMAS:
         )
 
     async def run(self, text: str, context_id: str) -> AgentReply:
-        from agents import Agent, Runner
+        from agents import Agent, ModelSettings, Runner
 
+        # La fecha de referencia viene del propio MCP para que el LLM no la adivine.
+        dates = await McpTools(self.mcp_url).call("fecha_actual")
+        today = f"\nHoy es {dates['today']}; el último día con pronóstico es {dates['last_forecast_day']}."
         extra = {"model": self.model} if self.model else {}
-        route: list[str] = []
+        settings = ModelSettings(temperature=0.2)
         async with self._mcp("mcp-faq", FAQ_TOOLS) as faq_mcp, self._mcp("mcp-citas", SCHEDULER_TOOLS) as sched_mcp:
-            faq_agent = Agent(name="Agente FAQ", instructions=FAQ_PROMPT, mcp_servers=[faq_mcp], **extra)
-            scheduler = Agent(name="Agente Clima y Citas", instructions=SCHEDULER_PROMPT,
-                              mcp_servers=[sched_mcp], **extra)
+            faq_agent = Agent(name="Agente FAQ", instructions=FAQ_PROMPT, mcp_servers=[faq_mcp],
+                              model_settings=settings, **extra)
+            scheduler = Agent(name="Agente Clima y Citas", instructions=SCHEDULER_PROMPT + today,
+                              mcp_servers=[sched_mcp], model_settings=settings, **extra)
             coordinator = Agent(
                 name="Coordinador Parachute",
-                instructions=COORDINATOR_PROMPT,
+                instructions=COORDINATOR_PROMPT + today,
                 tools=[
                     faq_agent.as_tool("agente_faq", "Responde preguntas con el FAQ oficial de Parachute S.A."),
                     scheduler.as_tool("agente_clima_citas",
                                       "Evalúa el clima de salto con Open-Meteo y agenda o lista citas."),
                 ],
+                model_settings=settings,
                 **extra,
             )
             history = self._history.get(context_id, [])
-            result = await Runner.run(coordinator, history + [{"role": "user", "content": text}])
-        self._history[context_id] = result.to_input_list()[-20:]
-        for item in result.new_items:
-            raw = getattr(item, "raw_item", None)
-            tool = getattr(raw, "name", None)
-            if item.type == "tool_call_item" and tool:
-                route.append(tool)
+            for attempt in (1, 2):  # Groq devuelve errores 400 transitorios ocasionales
+                try:
+                    result = await Runner.run(coordinator, history + [{"role": "user", "content": text}])
+                    break
+                except Exception as exc:
+                    if attempt == 2:
+                        raise
+                    log.warning("reintentando tras error del modelo: %s", exc)
+        self._history[context_id] = _last_turns(result.to_input_list(), turns=4)
+        route = [getattr(item.raw_item, "name", "?") for item in result.new_items if item.type == "tool_call_item"]
         return AgentReply(str(result.final_output), ["coordinador", *route])
+
+
+def _last_turns(items: list[Any], turns: int) -> list[Any]:
+    """Recorta el historial en un límite de mensaje del usuario para no separar llamada y resultado."""
+    starts = [i for i, item in enumerate(items) if isinstance(item, dict) and item.get("role") == "user"]
+    return items[starts[-turns]:] if len(starts) > turns else items
 
 
 # --------------------------------------------------------------------------- Determinista (sin LLM)
@@ -241,7 +266,7 @@ class RuleBasedMAS:
         if requested is None:
             self._pending[context_id] = {"booking": wants_booking, "name": name, "people": people}
             return AgentReply(f"¿Para qué fecha? Hoy es {today}; puedo revisar hasta "
-                              f"{today + timedelta(days=16)} (formato YYYY-MM-DD).", route)
+                              f"{today + timedelta(days=15)} (formato YYYY-MM-DD).", route)
         if wants_booking and not name:
             self._pending[context_id] = {"booking": True, "date": requested.isoformat(), "people": people}
             return AgentReply("¿A nombre de quién agendo la cita?", route)
@@ -257,6 +282,8 @@ class RuleBasedMAS:
         if r["status"] == "out_of_range":
             return AgentReply(r["error"], route)
         v = r["values"]
+        if r["status"] == "unavailable":
+            return AgentReply(f"{r['date']}: sin pronóstico completo — {'; '.join(r['reasons'])}.", route)
         verdict = {"favorable": "FAVORABLE para saltar", "marginal": "MARGINAL (solo tándem experimentado)",
                    "rejected": "NO SEGURO para saltar"}[r["status"]]
         detail = "; ".join(r["reasons"]) or "todas las variables en rango ideal"

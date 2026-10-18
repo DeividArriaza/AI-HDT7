@@ -4,3 +4,5 @@ __pycache__/
 data/appointments.json
 logs/
 .env
+docs/*.cast
+docs/*.gif

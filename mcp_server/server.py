@@ -79,8 +79,8 @@ def buscar_faq(pregunta: str) -> dict:
 def consultar_clima_salto(fecha: str) -> dict:
     """Evalúa con Open-Meteo si una fecha (YYYY-MM-DD) es apta para saltar en la zona de aterrizaje.
 
-    Solo acepta fechas entre hoy y los próximos 16 días. Devuelve `status`
-    (favorable | marginal | rejected), razones, valores medidos y la URL citada.
+    Solo acepta fechas entre hoy y `last_forecast_day` (16 días contando hoy). Devuelve `status`
+    (favorable | marginal | rejected | unavailable), razones, valores medidos y la URL citada.
     """
     try:
         return weather.assess(_parse_date(fecha)).to_dict()
@@ -113,14 +113,17 @@ def listar_citas(nombre: str | None = None) -> dict:
 def fecha_actual() -> dict:
     """Devuelve la fecha de referencia del sistema y el último día con pronóstico disponible."""
     today = weather.today
-    return {"today": today.isoformat(), "last_forecast_day": date.fromordinal(today.toordinal() + 16).isoformat()}
+    return {"today": today.isoformat(), "last_forecast_day": weather.last_forecast_day.isoformat()}
 
 
 def main() -> None:
     host = os.environ.get("MCP_HOST", "127.0.0.1")
     port = int(os.environ.get("MCP_PORT", "8000"))
     log.info("Servidor MCP 'parachute-tools' en http://%s:%d/mcp (Streamable HTTP)", host, port)
-    mcp.run("streamable-http", host=host, port=port)
+    try:
+        mcp.run("streamable-http", host=host, port=port)
+    except KeyboardInterrupt:
+        log.info("Servidor MCP detenido")
 
 
 if __name__ == "__main__":

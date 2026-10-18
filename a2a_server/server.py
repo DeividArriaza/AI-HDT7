@@ -24,6 +24,8 @@ from .mas import MCP_URL, MultiAgentSystem, build_mas
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [A2A] %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("parachute.a2a")
+for noisy in ("httpx", "httpx2", "mcp.client", "openai", "openai.agents"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 
 HOST = os.environ.get("A2A_HOST", "127.0.0.1")
 PORT = int(os.environ.get("A2A_PORT", "9999"))
